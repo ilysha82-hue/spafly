@@ -22,7 +22,8 @@ import {
   SpaEnvironmentHandle,
 } from './spaEnvironment';
 import { createProceduralTextures, ProceduralTexturePack } from './textures';
-import { GamePhase, HudSnapshot, PickupKind, PlayerMode } from './types';
+import { NetClient, PickupInfo, RemoteState, Spawn } from './net';
+import { BoardRow, ConnectionState, GamePhase, HudSnapshot, PickupKind, PlayerMode } from './types';
 
 // Module-scope reusable math helpers (Zero GC in loop)
 const _v1 = new THREE.Vector3();
@@ -44,6 +45,28 @@ interface Projectile {
   life: number;
   damage: number;
   active: boolean;
+  /** Выстрел другого игрока: только рисуем, попадание считает стрелок. */
+  remote: boolean;
+}
+
+interface RemotePlayer {
+  id: number;
+  nick: string;
+  plane: PlaneModelHandle;
+  char: CharacterModelHandle;
+  label: THREE.Sprite;
+  planePos: THREE.Vector3;
+  planeQuat: THREE.Quaternion;
+  charPos: THREE.Vector3;
+  charYaw: number;
+  charMode: number;
+  speed: number;
+  parked: boolean;
+  hp: number;
+  dead: boolean;
+  seen: boolean;
+  walk: number;
+  prevCharPos: THREE.Vector3;
 }
 
 interface EnemyPlane {
@@ -72,6 +95,7 @@ interface EjectedNpc {
 }
 
 interface PickupItem {
+  id: number;
   kind: PickupKind;
   mesh: THREE.Group;
   pos: THREE.Vector3;
@@ -191,9 +215,45 @@ export class SpaFlightEngine {
   private hudSyncAccum = 0;
   private resizeObserver: ResizeObserver | null = null;
 
+  // Multiplayer state
+  private net: NetClient;
+  private connection: ConnectionState = 'idle';
+  private connectionError: string | null = null;
+  private myId = 0;
+  private nick = '';
+  private deaths = 0;
+  private dead = false;
+  private board: BoardRow[] = [];
+  private feed: { text: string; ttl: number }[] = [];
+  private remotes = new Map<number, RemotePlayer>();
+  private netSendAccum = 0;
+  private shotQueue: { p: number[]; d: number[]; s: number; k: number }[] = [];
+
   constructor(container: HTMLElement, onHudUpdate: (snapshot: HudSnapshot) => void) {
     this.container = container;
     this.onHudUpdate = onHudUpdate;
+    this.net = new NetClient({
+      onWelcome: (m) => this.handleWelcome(m),
+      onJoin: (p) => this.addRemote(p.id, p.nick),
+      onLeave: (id) => this.removeRemote(id),
+      onSnap: (ps) => this.handleSnap(ps),
+      onShot: (m) => this.handleRemoteShot(m),
+      onDamage: (hp, by) => this.handleDamageFromServer(hp, by),
+      onHp: (hp) => {
+        this.planeHp = hp;
+        this.playerHp = hp;
+      },
+      onHitOk: () => {
+        this.hitMarkerTimer = 0.16;
+        this.sound.playHit(false);
+      },
+      onKill: (m) => this.handleKill(m),
+      onRespawn: (m) => this.respawnLocal(m),
+      onPickupAdd: (item) => this.addPickupFromServer(item),
+      onPickupRemove: (id, by) => this.removePickupFromServer(id, by),
+      onBoard: (rows) => this.handleBoard(rows),
+      onClose: (reason, wasOnline) => this.handleNetClose(reason, wasOnline),
+    });
 
     try {
       const saved = localStorage.getItem('aqua_ace_best_score');
@@ -328,6 +388,7 @@ export class SpaFlightEngine {
         life: 0,
         damage: 25,
         active: false,
+        remote: false,
       });
     }
 
@@ -376,9 +437,76 @@ export class SpaFlightEngine {
   // -------------------------------------------------------
   // PUBLIC CONTROLS FOR REACT SHELL
   // -------------------------------------------------------
-  public startGame(): void {
+  /** Вход в игру по нику: открываем WebSocket, после «welcome» начинается бой. */
+  public startGame(nick: string): void {
     this.sound.unlock();
+    this.nick = nick.trim().slice(0, 16);
+    this.connection = 'connecting';
+    this.connectionError = null;
+    this.emitHud();
+    this.net.connect(this.nick);
+  }
+
+  public leaveGame(): void {
+    this.net.close();
+    this.resetToTitle();
+  }
+
+  private resetToTitle(): void {
+    this.clearRemotes();
     this.clearDynamicEntities();
+    this.heldKeys.clear();
+    this.mouseFireHeld = false;
+    this.sound.updateEngine(false, 0, false);
+    this.phase = 'title';
+    this.connection = 'idle';
+    this.dead = false;
+    this.myId = 0;
+    this.board = [];
+    this.feed = [];
+    this.mode = 'plane';
+    this.camera.fov = 62;
+    this.camera.updateProjectionMatrix();
+    this.playerChar.root.visible = false;
+    this.playerPlane.root.visible = true;
+    this.playerPlane.seatedPilot.visible = true;
+    this.playerPlane.beaconRing.visible = false;
+    this.setupInitialTitleScene();
+  }
+
+  private handleNetClose(reason: string | null, wasOnline: boolean): void {
+    this.clearRemotes();
+    if (this.phase === 'title') {
+      this.connection = reason || !wasOnline ? 'error' : 'idle';
+      this.connectionError = reason || (wasOnline ? null : 'Не удалось подключиться к серверу');
+      this.emitHud();
+      return;
+    }
+    this.resetToTitle();
+    this.connection = 'error';
+    this.connectionError = reason || 'Соединение с сервером потеряно';
+    this.emitHud();
+  }
+
+  private handleWelcome(m: {
+    id: number;
+    nick: string;
+    spawn: Spawn;
+    players: { id: number; nick: string; hp: number; dead: boolean }[];
+    pickups: PickupInfo[];
+    board: BoardRow[];
+  }): void {
+    this.clearDynamicEntities();
+    this.myId = m.id;
+    this.nick = m.nick;
+    this.connection = 'online';
+    this.connectionError = null;
+    this.board = m.board;
+    this.feed = [];
+    this.deaths = 0;
+    this.dead = false;
+    m.players.forEach((p) => this.addRemote(p.id, p.nick));
+    m.pickups.forEach((p) => this.addPickupFromServer(p));
 
     this.phase = 'playing';
     this.mode = 'plane';
@@ -396,8 +524,8 @@ export class SpaFlightEngine {
     this.turboRemaining = 0;
     this.invulnTimer = 1.5;
 
-    this.planePos.set(0, 12.0, 52);
-    this.planeYaw = 0;
+    this.planePos.set(m.spawn.x, m.spawn.y, m.spawn.z);
+    this.planeYaw = m.spawn.yaw;
     this.planePitch = 0;
     this.planeRoll = 0;
     this.planeSpeed = 16;
@@ -417,22 +545,304 @@ export class SpaFlightEngine {
     this.camYawOffset = 0;
     this.camPitchOffset = 0.14;
 
-    this.spawnEnemiesForWave(1, false);
-    this.showWaveBanner('ВОЛНА 1 · СТАРТ!');
+    this.showWaveBanner('ДОБРО ПОЖАЛОВАТЬ В АРЕНУ, ' + this.nick.toUpperCase() + '!');
     this.emitHud();
   }
 
-  public togglePause(): void {
-    if (this.phase === 'playing') {
-      this.phase = 'paused';
+  // -------------------------------------------------------
+  // MULTIPLAYER
+  // -------------------------------------------------------
+  private makeNameLabel(nick: string): THREE.Sprite {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = 'rgba(15,24,42,0.78)';
+      ctx.beginPath();
+      ctx.roundRect(4, 8, 248, 48, 14);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(253,230,138,0.75)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#fde68a';
+      ctx.font = 'bold 28px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(nick, 128, 33, 232);
+    }
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, fog: false });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(6.4, 1.6, 1);
+    sprite.renderOrder = 10;
+    return sprite;
+  }
+
+  private addRemote(id: number, nick: string): void {
+    if (id === this.myId || this.remotes.has(id)) return;
+    const palette = ENEMY_PLANE_PALETTES[id % ENEMY_PLANE_PALETTES.length];
+    const plane = createPlaneModel(palette, this.textures, false);
+    plane.root.visible = false;
+    this.scene.add(plane.root);
+    const char = createCharacterModel(this.textures, palette.hatRibbon);
+    char.root.visible = false;
+    this.scene.add(char.root);
+    const label = this.makeNameLabel(nick);
+    label.visible = false;
+    this.scene.add(label);
+    this.remotes.set(id, {
+      id,
+      nick,
+      plane,
+      char,
+      label,
+      planePos: new THREE.Vector3(),
+      planeQuat: new THREE.Quaternion(),
+      charPos: new THREE.Vector3(),
+      charYaw: 0,
+      charMode: 0,
+      speed: 16,
+      parked: false,
+      hp: 100,
+      dead: false,
+      seen: false,
+      walk: 0,
+      prevCharPos: new THREE.Vector3(),
+    });
+    this.pushFeed(`${nick} вошёл в арену`);
+  }
+
+  private removeRemote(id: number): void {
+    const r = this.remotes.get(id);
+    if (!r) return;
+    this.scene.remove(r.plane.root);
+    this.scene.remove(r.char.root);
+    this.scene.remove(r.label);
+    (r.label.material.map as THREE.Texture | null)?.dispose();
+    r.label.material.dispose();
+    this.remotes.delete(id);
+    this.pushFeed(`${r.nick} вышел`);
+  }
+
+  private clearRemotes(): void {
+    for (const id of [...this.remotes.keys()]) {
+      const r = this.remotes.get(id)!;
+      this.scene.remove(r.plane.root);
+      this.scene.remove(r.char.root);
+      this.scene.remove(r.label);
+      (r.label.material.map as THREE.Texture | null)?.dispose();
+      r.label.material.dispose();
+    }
+    this.remotes.clear();
+  }
+
+  private pushFeed(text: string): void {
+    this.feed.push({ text, ttl: 7 });
+    if (this.feed.length > 5) this.feed.shift();
+  }
+
+  private handleSnap(ps: RemoteState[]): void {
+    for (const s of ps) {
+      const r = this.remotes.get(s.id);
+      if (!r) continue;
+      r.planePos.set(s.pp[0], s.pp[1], s.pp[2]);
+      r.planeQuat.set(s.pq[0], s.pq[1], s.pq[2], s.pq[3]);
+      r.charPos.set(s.cp[0], s.cp[1], s.cp[2]);
+      r.charYaw = s.cy;
+      r.charMode = s.cm;
+      r.speed = s.sp;
+      r.parked = s.pk === 1;
+      r.hp = s.hp;
+      r.dead = s.dd === 1;
+      if (!r.seen) {
+        r.seen = true;
+        r.plane.root.position.copy(r.planePos);
+        r.plane.root.quaternion.copy(r.planeQuat);
+        r.char.root.position.copy(r.charPos);
+        r.prevCharPos.copy(r.charPos);
+      }
+    }
+  }
+
+  private updateRemotes(dt: number): void {
+    const a = 1 - Math.exp(-16 * dt);
+    for (const r of this.remotes.values()) {
+      if (!r.seen || r.dead) {
+        r.plane.root.visible = false;
+        r.char.root.visible = false;
+        r.label.visible = false;
+        continue;
+      }
+      r.plane.root.visible = true;
+      r.plane.root.position.lerp(r.planePos, a);
+      r.plane.root.quaternion.slerp(r.planeQuat, a);
+      r.plane.propeller.rotation.z += dt * (r.parked || r.charMode !== 0 ? 2.5 : 14 + r.speed * 1.4);
+      r.plane.seatedPilot.visible = r.charMode === 0;
+      r.plane.beaconRing.visible = r.charMode !== 0;
+
+      let labelBase = r.plane.root.position;
+      let labelUp = 3.1;
+      if (r.charMode !== 0) {
+        r.char.root.visible = true;
+        r.char.root.position.lerp(r.charPos, a);
+        r.char.root.rotation.y = r.charYaw;
+        r.char.parachuteGroup.visible = r.charMode === 1;
+        const moved = r.char.root.position.distanceTo(r.prevCharPos);
+        r.prevCharPos.copy(r.char.root.position);
+        if (moved > 0.01 && r.charMode !== 1) {
+          r.walk += moved * 1.6;
+          const swing = Math.sin(r.walk) * 0.72;
+          r.char.leftLegPivot.rotation.x = swing;
+          r.char.rightLegPivot.rotation.x = -swing;
+          r.char.leftArmPivot.rotation.x = -swing * 0.8;
+        }
+        labelBase = r.char.root.position;
+        labelUp = 3.0;
+      } else {
+        r.char.root.visible = false;
+      }
+      r.label.visible = true;
+      r.label.position.set(labelBase.x, labelBase.y + labelUp, labelBase.z);
+    }
+  }
+
+  private sendNetState(dt: number): void {
+    this.netSendAccum += dt;
+    if (this.netSendAccum < 0.05) return;
+    this.netSendAccum = 0;
+    const q = this.playerPlane.root.quaternion;
+    this.net.send({
+      t: 'st',
+      pp: [this.planePos.x, this.planePos.y, this.planePos.z],
+      pq: [q.x, q.y, q.z, q.w],
+      cp: [this.charPos.x, this.charPos.y, this.charPos.z],
+      cy: this.charYaw,
+      cm: this.mode === 'plane' ? 0 : this.mode === 'parachute' ? 1 : this.mode === 'foot' ? 2 : 3,
+      sp: this.planeSpeed,
+      pk: this.mode !== 'plane' || this.planeParked ? 1 : 0,
+    });
+  }
+
+  private handleRemoteShot(m: { id: number; p: number[]; d: number[]; s: number; k: number }): void {
+    _v1.set(m.p[0], m.p[1], m.p[2]);
+    _v2.set(m.d[0], m.d[1], m.d[2]);
+    this.spawnProjectile(_v1, _v2, m.s, false, 0, true);
+  }
+
+  private handleDamageFromServer(hp: number, _by: number): void {
+    this.planeHp = hp;
+    this.playerHp = hp;
+    this.damageFlashTimer = 0.25;
+    this.shakeStrength = Math.max(this.shakeStrength, 0.38);
+    this.sound.playHit(true);
+  }
+
+  private handleKill(m: { killer: number; killerNick: string; victim: number; victimNick: string }): void {
+    if (m.killer) this.pushFeed(`${m.killerNick} сбил ${m.victimNick}`);
+    else this.pushFeed(`${m.victimNick} разбился`);
+
+    if (m.victim === this.myId) {
+      this.dead = true;
+      this.deaths += 1;
+      const pos = this.mode === 'plane' ? this.planePos : this.charPos;
+      this.spawnBurst(pos, 24, [0xff6b4a, 0xffd54f, 0x38bdf8, 0xffffff], 13, 9, 1.25, 0.75);
+      this.sound.playExplosion();
+      this.sound.updateEngine(false, 0, false);
+      this.hitstopTimer = 0.055;
+      this.shakeStrength = Math.max(this.shakeStrength, 0.5);
+      this.playerPlane.root.visible = false;
+      this.playerChar.root.visible = false;
       this.heldKeys.clear();
       this.mouseFireHeld = false;
-      this.sound.updateEngine(false, 0, false);
-      this.emitHud();
-    } else if (this.phase === 'paused') {
-      this.phase = 'playing';
-      this.lastTime = performance.now();
-      this.emitHud();
+      this.planeHp = 0;
+      this.playerHp = 0;
+      this.showWaveBanner(m.killer ? `ТЕБЯ СБИЛ ${m.killerNick.toUpperCase()}` : 'ТЫ РАЗБИЛСЯ');
+      this.waveBannerTimer = 3;
+    } else {
+      const r = this.remotes.get(m.victim);
+      if (r && r.seen) {
+        const pos = r.charMode === 0 ? r.plane.root.position : r.char.root.position;
+        this.spawnBurst(pos, 22, [0xff6b4a, 0xffd54f, 0x38bdf8, 0xffffff, 0x6ec49c], 13, 9, 1.25, 0.75);
+        this.sound.playExplosion();
+        r.dead = true;
+      }
+      if (m.killer === this.myId) {
+        this.showWaveBanner(`ТЫ СБИЛ ${m.victimNick.toUpperCase()}!`);
+        this.hitstopTimer = 0.042;
+      }
+    }
+  }
+
+  private respawnLocal(m: Spawn & { hp: number }): void {
+    this.dead = false;
+    this.mode = 'plane';
+    this.playerHp = m.hp;
+    this.planeHp = m.hp;
+    this.planeAlive = true;
+    this.planeRespawnCooldown = 0;
+    this.boostEnergy = 100;
+    this.turboRemaining = 0;
+    this.invulnTimer = 2.5;
+    this.planePos.set(m.x, m.y, m.z);
+    this.planeYaw = m.yaw;
+    this.planePitch = 0;
+    this.planeRoll = 0;
+    this.planeSpeed = 16;
+    this.planeParked = false;
+    this.loopTimer = 0;
+    this.loopCooldown = 0;
+    this.sideRollTimer = 0;
+    this.sideRollCooldown = 0;
+    this.planeVel.set(-Math.sin(m.yaw) * 16, 0, -Math.cos(m.yaw) * 16);
+    this.charPos.copy(this.planePos);
+    this.playerPlane.root.visible = true;
+    this.playerPlane.seatedPilot.visible = true;
+    this.playerPlane.beaconRing.visible = false;
+    this.playerChar.root.visible = false;
+    this.playerChar.parachuteGroup.visible = false;
+    this.camPos.copy(this.planePos).add(new THREE.Vector3(0, 3, 9));
+    this.waveBanner = null;
+    this.showWaveBanner('ВОЗРОЖДЕНИЕ!');
+    this.emitHud();
+  }
+
+  private addPickupFromServer(item: PickupInfo): void {
+    if (this.pickups.some((p) => p.id === item.id)) return;
+    const mesh = createPickupModel(item.kind);
+    mesh.position.set(item.x, item.y, item.z);
+    this.scene.add(mesh);
+    this.pickups.push({
+      id: item.id,
+      kind: item.kind,
+      mesh,
+      pos: new THREE.Vector3(item.x, item.y, item.z),
+      bobPhase: Math.random() * Math.PI * 2,
+      active: true,
+    });
+  }
+
+  private removePickupFromServer(id: number, by: number): void {
+    const p = this.pickups.find((x) => x.id === id);
+    if (!p) return;
+    if (p.active && by !== this.myId) {
+      this.spawnBurst(p.mesh.position, 8, [0xffd54f, 0x34d399, 0x38bdf8], 6, 4, 0.8, 0.4);
+    }
+    this.scene.remove(p.mesh);
+    this.pickups = this.pickups.filter((x) => x !== p);
+  }
+
+  private handleBoard(rows: BoardRow[]): void {
+    this.board = rows;
+    const me = rows.find((r) => r.id === this.myId);
+    if (me && me.score > this.bestScore) {
+      this.bestScore = me.score;
+      try {
+        localStorage.setItem('aqua_ace_best_score', String(this.bestScore));
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -440,6 +850,35 @@ export class SpaFlightEngine {
     const muted = this.sound.toggleMute();
     this.emitHud();
     return muted;
+  }
+
+  // --- Сенсорное управление (телефон): стик и кнопки превращаются в «зажатые клавиши» ---
+  private setKey(code: string, down: boolean): void {
+    if (down) {
+      if (!this.heldKeys.has(code)) this.justPressed.add(code);
+      this.heldKeys.add(code);
+    } else {
+      this.heldKeys.delete(code);
+    }
+  }
+
+  public setTouchStick(x: number, y: number): void {
+    const dz = 0.28;
+    this.setKey('KeyA', x < -dz);
+    this.setKey('KeyD', x > dz);
+    this.setKey('KeyW', y > dz);
+    this.setKey('KeyS', y < -dz);
+  }
+
+  public setTouchHold(btn: 'fire' | 'boost' | 'brake', down: boolean): void {
+    if (btn === 'fire') this.mouseFireHeld = down && this.phase === 'playing';
+    else if (btn === 'boost') this.setKey('ShiftLeft', down);
+    else this.setKey('KeyC', down);
+    if (down) this.sound.unlock();
+  }
+
+  public triggerJump(): void {
+    if (this.phase === 'playing') this.justPressed.add('Space');
   }
 
   public triggerEjectOrBoard(): void {
@@ -470,23 +909,16 @@ export class SpaFlightEngine {
   // INPUT BINDINGS
   // -------------------------------------------------------
   private handleKeyDown = (e: KeyboardEvent) => {
+    const el = e.target as HTMLElement | null;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return;
     if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
       e.preventDefault();
-    }
-    if (e.code === 'Escape') {
-      if (this.phase === 'playing' || this.phase === 'paused') {
-        this.togglePause();
-      }
-      return;
     }
     if (e.code === 'KeyM') {
       this.toggleMute();
       return;
     }
-    if (this.phase === 'title' && (e.code === 'Enter' || e.code === 'Space')) {
-      this.startGame();
-      return;
-    }
+    if (this.phase !== 'playing') return;
     if (!this.heldKeys.has(e.code)) {
       this.justPressed.add(e.code);
     }
@@ -505,6 +937,7 @@ export class SpaFlightEngine {
   };
 
   private handlePointerDown = (e: PointerEvent) => {
+    if (e.pointerType === 'touch') return;
     if (this.phase !== 'playing') return;
     this.sound.unlock();
     if (e.button === 0) {
@@ -642,19 +1075,32 @@ export class SpaFlightEngine {
     speed: number,
     fromPlayer: boolean,
     damage: number,
+    remote = false,
   ): void {
     const slot = this.projectiles.find((p) => !p.active);
     if (!slot) return;
 
     slot.active = true;
     slot.fromPlayer = fromPlayer;
+    slot.remote = remote;
     slot.damage = damage;
     slot.life = fromPlayer ? 1.8 : 2.5;
     slot.pos.copy(origin);
     slot.vel.copy(dir).normalize().multiplyScalar(speed);
 
+    if (fromPlayer && !remote) {
+      _v4.copy(slot.vel).normalize();
+      this.net.send({
+        t: 'shot',
+        p: [origin.x, origin.y, origin.z],
+        d: [_v4.x, _v4.y, _v4.z],
+        s: speed,
+        k: this.mode === 'plane' ? 0 : 1,
+      });
+    }
+
     const mat = slot.mesh.material as THREE.MeshBasicMaterial;
-    mat.color.setHex(fromPlayer ? 0x38bdf8 : 0xff6b4a);
+    mat.color.setHex(remote ? 0xffb454 : fromPlayer ? 0x38bdf8 : 0xff6b4a);
     slot.mesh.position.copy(origin);
     _v1.copy(origin).add(slot.vel);
     slot.mesh.lookAt(_v1);
@@ -707,6 +1153,7 @@ export class SpaFlightEngine {
     mesh.position.copy(clampedPos);
     this.scene.add(mesh);
     this.pickups.push({
+      id: -1,
       kind,
       mesh,
       pos: clampedPos,
@@ -857,6 +1304,24 @@ export class SpaFlightEngine {
       this.summonFreshPlane();
     }
 
+    for (const f of this.feed) f.ttl -= dt;
+    this.feed = this.feed.filter((f) => f.ttl > 0);
+
+    if (this.dead) {
+      // Сбит: ждём возрождения от сервера, мир вокруг продолжает жить
+      this.updateProjectiles(dt);
+      this.updateParticles(dt);
+      this.updateRemotes(dt);
+      this.sendNetState(dt);
+      this.updateCamera(dt);
+      this.hudSyncAccum += dt;
+      if (this.hudSyncAccum >= 0.05) {
+        this.hudSyncAccum = 0;
+        this.emitHud();
+      }
+      return;
+    }
+
     // Update active player controller
     if (this.mode === 'plane') {
       this.updatePlaneFlight(dt);
@@ -865,31 +1330,11 @@ export class SpaFlightEngine {
       this.updateCharacter(dt);
     }
 
-    // Update enemies, projectiles, pickups, particles
-    this.updateEnemies(dt);
     this.updateProjectiles(dt);
     this.updatePickups(dt);
     this.updateParticles(dt);
-    this.updateEjectedNpcs(dt);
-
-    // Check Wave clear
-    const aliveEnemies = this.enemies.filter((e) => e.alive).length;
-    if (aliveEnemies === 0) {
-      if (this.nextWaveDelay <= 0) {
-        this.nextWaveDelay = 2.2;
-        this.sound.playWaveClear();
-        this.showWaveBanner(`ВОЛНА ${this.wave} ПРОЙДЕНА!`);
-      } else {
-        this.nextWaveDelay -= dt;
-        if (this.nextWaveDelay <= 0) {
-          this.wave += 1;
-          this.enemies.forEach((e) => this.scene.remove(e.model.root));
-          this.enemies = [];
-          this.spawnEnemiesForWave(this.wave, false);
-          this.showWaveBanner(`ВОЛНА ${this.wave}`);
-        }
-      }
-    }
+    this.updateRemotes(dt);
+    this.sendNetState(dt);
 
     this.updateCamera(dt);
 
@@ -1615,14 +2060,23 @@ export class SpaFlightEngine {
         continue;
       }
 
+      if (proj.remote) continue;
+
       if (proj.fromPlayer) {
-        // Check enemy plane hits
-        for (const enemy of this.enemies) {
-          if (!enemy.alive) continue;
-          if (proj.pos.distanceToSquared(enemy.pos) <= 2.3 * 2.3) {
+        // Попадание в другого игрока: считаем у себя, сервер проверяет и вычитает HP
+        if (this.dead) continue;
+        for (const r of this.remotes.values()) {
+          if (!r.seen || r.dead) continue;
+          const inPlane = r.charMode === 0;
+          if (inPlane) _v1.copy(r.plane.root.position);
+          else _v1.copy(r.char.root.position).y += 1.0;
+          const rad = inPlane ? 2.4 : 1.2;
+          if (proj.pos.distanceToSquared(_v1) <= rad * rad) {
             proj.active = false;
             proj.mesh.visible = false;
-            this.damageEnemy(enemy, proj.damage);
+            this.net.send({ t: 'hit', id: r.id, dmg: proj.damage });
+            r.plane.setHitFlash(1);
+            this.spawnBurst(proj.pos, 6, [0xffffff, 0xffd54f, 0xff6b4a], 7, 6, 0.7, 0.35);
             break;
           }
         }
@@ -1718,21 +2172,14 @@ export class SpaFlightEngine {
       p.mesh.position.y = p.pos.y + Math.sin(p.bobPhase) * 0.28;
       p.mesh.rotation.y += dt * 1.8;
 
-      if (collectorPos.distanceTo(p.mesh.position) <= radius) {
+      if (!this.dead && collectorPos.distanceTo(p.mesh.position) <= radius) {
         p.active = false;
         p.mesh.visible = false;
         this.sound.playPickup();
         this.spawnBurst(p.mesh.position, 10, [0xffd54f, 0x34d399, 0x38bdf8], 7, 4, 0.85, 0.45);
-
-        if (p.kind === 'duck') {
-          this.score += 150 * this.combo;
-          this.comboTimer = 4.5;
-        } else if (p.kind === 'repair') {
-          this.playerHp = Math.min(this.maxPlayerHp, this.playerHp + 35);
-          if (this.planeAlive) {
-            this.planeHp = Math.min(this.maxPlaneHp, this.planeHp + 40);
-          }
-        } else {
+        // лечение и очки начисляет сервер (первый успевший забирает бонус)
+        this.net.send({ t: 'pick', id: p.id });
+        if (p.kind === 'turbo') {
           this.turboRemaining = 8.0;
           this.boostEnergy = 100;
         }
@@ -1838,7 +2285,16 @@ export class SpaFlightEngine {
 
   private emitHud(): void {
     const distToPlane = this.planeAlive ? this.charPos.distanceTo(this.planePos) : 999;
+    const me = this.board.find((r) => r.id === this.myId);
     this.onHudUpdate({
+      connection: this.connection,
+      connectionError: this.connectionError,
+      myId: this.myId,
+      nick: this.nick,
+      dead: this.dead,
+      board: this.board,
+      feed: this.feed.map((f) => f.text),
+      deaths: me ? me.deaths : this.deaths,
       phase: this.phase,
       mode: this.mode,
       playerHp: Math.ceil(this.playerHp),
@@ -1852,12 +2308,12 @@ export class SpaFlightEngine {
       altitude: Math.max(0, Math.round(this.mode === 'plane' ? this.planePos.y : this.charPos.y)),
       boostEnergy: Math.round(this.boostEnergy),
       turboRemaining: Math.ceil(this.turboRemaining),
-      score: this.score,
+      score: me ? me.score : 0,
       bestScore: this.bestScore,
       combo: this.combo,
-      kills: this.kills,
+      kills: me ? me.kills : 0,
       wave: this.wave,
-      enemiesRemaining: this.enemies.filter((e) => e.alive).length,
+      enemiesRemaining: this.remotes.size,
       waveBanner: this.waveBanner,
       muted: this.sound.isMuted(),
       hitMarkerTimer: this.hitMarkerTimer,
@@ -1869,6 +2325,7 @@ export class SpaFlightEngine {
 
   public dispose(): void {
     this.disposed = true;
+    this.net.close();
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
 

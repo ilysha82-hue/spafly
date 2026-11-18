@@ -21,6 +21,7 @@ const INITIAL_HUD: HudSnapshot = {
   bestScore: 0,
   combo: 1,
   kills: 0,
+  deaths: 0,
   wave: 1,
   enemiesRemaining: 3,
   waveBanner: null,
@@ -29,6 +30,13 @@ const INITIAL_HUD: HudSnapshot = {
   damageFlashTimer: 0,
   loopReady: true,
   sideRollReady: true,
+  connection: 'idle',
+  connectionError: null,
+  myId: 0,
+  nick: '',
+  dead: false,
+  board: [],
+  feed: [],
 };
 
 export default function App() {
@@ -44,6 +52,7 @@ export default function App() {
       setHud(snapshot);
     });
     engineRef.current = engine;
+    if (location.search.includes('debug')) (window as unknown as Record<string, unknown>).__engine = engine;
 
     return () => {
       engine.dispose();
@@ -52,15 +61,18 @@ export default function App() {
   }, []);
 
   return (
-    <main className="relative h-screen w-screen overflow-hidden bg-[#1b2d4e]">
+    <main className="relative h-screen w-screen touch-none select-none overflow-hidden bg-[#1b2d4e]">
       <div ref={mountRef} className="h-full w-full" />
       <GameHUD
         hud={hud}
-        onStart={() => engineRef.current?.startGame()}
-        onTogglePause={() => engineRef.current?.togglePause()}
+        onStart={(nick) => engineRef.current?.startGame(nick)}
+        onLeave={() => engineRef.current?.leaveGame()}
         onToggleMute={() => engineRef.current?.toggleMute()}
         onEjectOrBoard={() => engineRef.current?.triggerEjectOrBoard()}
         onSummonPlane={() => engineRef.current?.triggerSummonPlane()}
+        onTouchStick={(x, y) => engineRef.current?.setTouchStick(x, y)}
+        onTouchHold={(b, d) => engineRef.current?.setTouchHold(b, d)}
+        onJump={() => engineRef.current?.triggerJump()}
         onTriggerLoop={() => engineRef.current?.triggerLoop()}
         onTriggerSideRoll={(dir?: 1 | -1) => engineRef.current?.triggerSideRoll(dir)}
       />

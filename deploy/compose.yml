@@ -1,0 +1,12 @@
+# /opt/stacks/fly/compose.yml — Аква-Ас онлайн (fly.ilysha.ru). Исходники лежат рядом в ./app
+name: fly
+services:
+  app:
+    build: ./app
+    image: fly-app:latest
+    container_name: fly-app
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:4100:8080"
