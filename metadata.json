@@ -1,0 +1,6 @@
+{
+  "name": "Аква-Ас: Спа-Небо",
+  "description": "3D-игра про полёты и воздушные бои на игрушечных гидросамолётах внутри огромного термального спа-комплекса с бассейном и возможностью катапультироваться.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
